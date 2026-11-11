@@ -56,6 +56,22 @@ EPS = 1e-8
 
 # ── windows ──────────────────────────────────────────────────────────────────
 
+def train_starts(T, score_len, stride):
+    """Window starts for training, which need not tile.
+
+    The evaluation has to tile: each position is scored exactly once, which is
+    the released protocol and what makes the position count comparable with
+    ours. Training carries no such constraint, and reusing the tiling there
+    throws away almost all of the data. On BJ-AIR a stride equal to the scored
+    length leaves 123 windows, which at batch 8 over 20 epochs is 320 gradient
+    steps; SATCN's own demo gets about ten thousand, because its scored length
+    is 4 rather than 24. A stride of one restores that, and a larger stride is
+    there for the datasets where it costs too much time.
+    """
+    last = max(T - score_len, 0)
+    return list(range(0, last + 1, stride))
+
+
 def tile(T, score_len, t_reduce):
     """Starts of the scored segments, covering every step exactly once.
 
@@ -204,8 +220,18 @@ def main():
     ap.add_argument('--layers', type=int, default=1)
     ap.add_argument('--t-kernel', type=int, default=2)
     ap.add_argument('--least-k', type=int, default=2)
-    ap.add_argument('--nv', type=int, default=20,
-                    help='nodes masked per step during training')
+    ap.add_argument('--nv-frac', type=float, default=20. / 103.,
+                    help='share of nodes withheld per step in training. SATCN '
+                         'sets this as a count, N_v=20, against the 103 '
+                         'training nodes of its METR-LA split, so the share it '
+                         'uses is about 0.19; a count carried over to a '
+                         'smaller node set withholds everything and the model '
+                         'sees an empty input')
+    ap.add_argument('--train-stride', type=int, default=1,
+                    help='stride of the training windows; the evaluation '
+                         'always tiles')
+    ap.add_argument('--nv', type=int, default=0,
+                    help='absolute node count, overriding --nv-frac')
     ap.add_argument('--channels', type=int, default=128)
     ap.add_argument('--epochs', type=int, default=20)
     ap.add_argument('--batch-size', type=int, default=8)
@@ -272,12 +298,32 @@ def main():
 
     # Training windows, on V_o only.
     tr, m_tr = d['train_data'], d['train_mask']
-    starts_tr = tile(tr.shape[0], args.score_len, t_reduce)
+    starts_tr = train_starts(tr.shape[0], args.score_len, args.train_stride)
     x_tr, mk_tr = gather(tr, m_tr, starts_tr, args.score_len, t_reduce)
     y_tr = scored_slice(tr, starts_tr, args.score_len)
     ym_tr = scored_slice(m_tr, starts_tr, args.score_len)
-    print('  train windows: %d   val steps: %d   test steps: %d'
-          % (len(starts_tr), len(d['val_data']), len(d['test_data_random'])))
+
+    # How many nodes to withhold per step. A count large enough to cover the
+    # node set empties the input at every step, and the model can then only
+    # learn a constant: the loss settles at the value a constant gives, the
+    # frozen arm matches the trained one, and least_k stops mattering. That
+    # failure produces entirely plausible figures, so it is refused here rather
+    # than reported.
+    n_o = int(d['n_known'])
+    nv = args.nv if args.nv > 0 else int(round(args.nv_frac * n_o))
+    nv = max(0, min(nv, n_o - 1))
+    if args.nv > 0 and args.nv >= n_o:
+        raise SystemExit(
+            '--nv %d withholds every one of the %d training nodes at every '
+            'step, leaving an empty input; pass --nv-frac instead, or an --nv '
+            'below %d' % (args.nv, n_o, n_o))
+    print('  train windows: %d (stride %d)   val steps: %d   test steps: %d'
+          % (len(starts_tr), args.train_stride, len(d['val_data']),
+             len(d['test_data_random'])))
+    print('  withholding %d of %d nodes per step (%.0f%%), %d gradient steps '
+          'over %d epochs'
+          % (nv, n_o, 100. * nv / max(n_o, 1),
+             args.epochs * -(-len(starts_tr) // args.batch_size), args.epochs))
 
     rng = np.random.RandomState(args.seed)
     best, best_val, hist = None, float('inf'), []
@@ -292,11 +338,11 @@ def main():
             mk = mk_tr[idx].copy()
             # SATCN's inductive masking: a fresh set of nodes is withheld at
             # every step, which is the training signal its paper describes.
-            if args.nv > 0:
+            if nv > 0:
                 B, _, L, N = x.shape
                 for b in range(B):
                     for t in range(L):
-                        hide = rng.choice(N, min(args.nv, N), replace=False)
+                        hide = rng.choice(N, nv, replace=False)
                         x[b, 0, t, hide] = 0.
                         mk[b, 0, t, hide] = 0.
             xt = torch.from_numpy(scaler.transform(x)).to(device)
@@ -364,7 +410,8 @@ def main():
             'model': {'name': 'SATCN', 'source': 'Kaimaoge/SATCN',
                       'layers': args.layers, 't_kernel': args.t_kernel,
                       'least_k': args.least_k, 'channels': args.channels,
-                      'N_v': args.nv,
+                      'N_v': nv, 'N_v_fraction': round(nv / max(n_o, 1), 4),
+                      'train_stride': args.train_stride,
                       'train_spatial': not args.released_frozen_spatial,
                       'adj_source': adj_source, 'variant': variant,
                       'trainable_parameters': n_par},
