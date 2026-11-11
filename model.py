@@ -68,7 +68,8 @@ class STower(nn.Module):
     Spatil aggragation layer applies principle aggragation on the spatial dimension
     """      
     def __init__(self, in_features, out_features, aggregators, scalers,  avg_d,
-                 device = 'cuda', masking = False, dropout = 0.1):
+                 device = 'cuda', masking = False, dropout = 0.1,
+                 train_spatial = True):
         super(STower, self).__init__()
         
         self.device = device
@@ -77,8 +78,22 @@ class STower(nn.Module):
         self.aggregators = aggregators
         self.scalers = scalers
         
-        self.Theta_po = nn.Parameter(torch.FloatTensor(len(aggregators) * len(scalers) * self.in_features, self.out_features)).cuda()
-        self.bias_po = nn.Parameter(torch.FloatTensor(self.out_features)).cuda() 
+        # nn.Parameter(...).cuda() returns a plain non-leaf Tensor rather than a
+        # Parameter, so the weight is left out of parameters() and state_dict():
+        # the optimiser never updates it and it is dropped on save. The spatial
+        # aggregation of every STower therefore stays at its random
+        # initialisation for the whole run. Allocating on the device and keeping
+        # the Parameter is the same arithmetic with the weight trained, which is
+        # the model the paper describes. Pass train_spatial=False to reproduce
+        # the released behaviour instead.
+        W = torch.empty(len(aggregators) * len(scalers) * self.in_features,
+                        self.out_features, device=device)
+        b = torch.empty(self.out_features, device=device)
+        if train_spatial:
+            self.Theta_po, self.bias_po = nn.Parameter(W), nn.Parameter(b)
+        else:
+            self.register_buffer('Theta_po', W)
+            self.register_buffer('bias_po', b)
         self.reset_parameters()
         self.avg_d = avg_d   
         self.masking = masking
@@ -127,8 +142,10 @@ class SAGE(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.aggregators = aggregators
-        self.Theta_po = nn.Parameter(torch.FloatTensor(self.in_features, self.out_features)).cuda()
-        self.bias_po = nn.Parameter(torch.FloatTensor(self.out_features)).cuda() 
+        # Same correction as in STower; see the note there.
+        self.Theta_po = nn.Parameter(
+            torch.empty(self.in_features, self.out_features, device=device))
+        self.bias_po = nn.Parameter(torch.empty(self.out_features, device=device))
         self.reset_parameters()
         
     def reset_parameters(self):
@@ -183,15 +200,16 @@ class double_t_pna(nn.Module):
 class general_satcn(nn.Module):
 
     def __init__(self, avg_d, device, in_variables = 1, layers = 1, channels=32, t_kernel = 2, aggragators = ['mean', 'softmin', 'softmax', 'normalised_mean', 'std'], 
-                 scalers = ['identity', 'amplification', 'attenuation'], masking = True, dropout = 0):
+                 scalers = ['identity', 'amplification', 'attenuation'], masking = True, dropout = 0,
+                 train_spatial = True):
         super(general_satcn, self).__init__()
-        self.s_layer0 = STower(in_variables, channels, aggragators + ['distance','d_std'], ['identity'],avg_d, device, masking, dropout)
+        self.s_layer0 = STower(in_variables, channels, aggragators + ['distance','d_std'], ['identity'],avg_d, device, masking, dropout, train_spatial)
         self.t_layer0 = tcn_layer(t_kernel, channels, channels, dropout)
         self.s_convs = nn.ModuleList()
         self.t_convs = nn.ModuleList()
         self.layers = layers
         for i in range(layers):
-            self.s_convs.append(STower(channels, channels, aggragators, scalers, avg_d, device, False, dropout))
+            self.s_convs.append(STower(channels, channels, aggragators, scalers, avg_d, device, False, dropout, train_spatial))
             self.t_convs.append(tcn_layer(t_kernel, channels, channels, dropout))
         self.out_conv = nn.Conv2d(channels, in_variables, (1, 1), 1)
         

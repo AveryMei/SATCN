@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+satcn_data/
+logs_satcn/

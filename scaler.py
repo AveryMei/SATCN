@@ -27,7 +27,13 @@ def scale_amplification(X, adj, avg_d=None):
 def scale_attenuation(X, adj, avg_d=None):
     # (log(D + 1))^-1 / d * X     where d is the average of the ``log(D + 1))^-1`` in the training set
     D = torch.sum(adj, -1)
-    scale = (avg_d["log"] / torch.log(D + 1)).unsqueeze(-1)
+    # log(D + 1) vanishes exactly when the node has no neighbour, which a
+    # thresholded adjacency on a node subset does produce; the attenuation is
+    # then left at zero rather than infinite.
+    lg = torch.log(D + 1)
+    safe = torch.where(lg > 0, lg, torch.ones_like(lg))
+    scale = torch.where(lg > 0, avg_d["log"] / safe,
+                        torch.zeros_like(lg)).unsqueeze(-1)
     X_scaled = torch.mul(scale, X)
     return X_scaled
 

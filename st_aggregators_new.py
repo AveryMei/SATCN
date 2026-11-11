@@ -13,12 +13,25 @@ EPS = 1e-5
 # each aggregator is a function taking as input X (B x (S or T) x N x Din), adj (N x N), device
 # returning the aggregated value of X (B x (S or T) x N x Din) for each dimension
 
+def _nz(D):
+    """Denominators with the empty-neighbourhood case made explicit.
+
+    Every aggregator divides by a neighbour count or weight sum. SATCN's own
+    graph is a dense distance kernel, so that sum is never zero; a thresholded
+    adjacency restricted to a node subset does leave rows with no edge, and the
+    quotient then comes out NaN and poisons the whole forward pass. Substituting
+    one where the sum is zero makes such a position read as an empty sum, which
+    is zero, and leaves every other position exactly as it was.
+    """
+    return torch.where(D > 0, D, torch.ones_like(D))
+
+
 def aggregate_mean(X, adj, device = 'cpu'):
     adj_ = torch.sign(adj)
     D = torch.sum(adj_, -1, keepdim=True)
 
     X_sum =  torch.einsum("btji,oj->btoi", [X, adj_])
-    X_mean = torch.div(X_sum, D)
+    X_mean = torch.div(X_sum, _nz(D))
     return X_mean
 
 def aggregate_normalised_mean(X, adj, device='cpu'):
@@ -26,30 +39,30 @@ def aggregate_normalised_mean(X, adj, device='cpu'):
     D = torch.sum(adj, -1, keepdim=True)
 
     X_sum =  torch.einsum("btji,oj->btoi", [X, adj])
-    X_mean = torch.div(X_sum, D)
+    X_mean = torch.div(X_sum, _nz(D))
     return X_mean
 
 def aggregate_d(X, adj, device='cpu'):
     # D^{-1} A * X    i.e. the mean of the neighbours
     (B, ST, N, D) = X.shape
-    P = torch.ones([B, ST, N, 1]).cuda()
+    P = torch.ones([B, ST, N, 1], device=X.device, dtype=X.dtype)
     adj_ = torch.sign(adj)
     D = torch.sum(adj_, -1, keepdim=True)
 #    rD = torch.mul(torch.pow(torch.sum(adj, -1, keepdim=True), -0.5), torch.eye(N, device=device))  # D^{-1/2]
 #    adj = torch.matmul(torch.matmul(rD, adj), rD)
     X_sum =  torch.einsum("btji,oj->btoi", [P, adj])
-    X_mean = torch.div(X_sum, D)
+    X_mean = torch.div(X_sum, _nz(D))
     return X_mean
 
 def aggregate_d_var(X, adj, device='cpu'):
     # relu(D^{-1} A X^2 - (D^{-1} A X)^2)     i.e.  the variance of the features of the neighbours
 
     (B, ST, N, D) = X.shape
-    P = torch.ones([B, ST, N, 1]).cuda()
+    P = torch.ones([B, ST, N, 1], device=X.device, dtype=X.dtype)
     D = torch.sum(adj, -1, keepdim=True)
 
     X_sum = torch.einsum("btji,oj->btoi", [P * P, adj])
-    X_sum = torch.div(X_sum, D) 
+    X_sum = torch.div(X_sum, _nz(D)) 
     X_mean = aggregate_mean(X, adj)  # D^{-1} A X
     var = torch.relu(X_sum - X_mean * X_mean)  # relu(mean_squares_X - mean_X^2)
     return var
@@ -84,7 +97,7 @@ def aggregate_var(X, adj, device='cpu'):
     D = torch.sum(adj, -1, keepdim=True)
 
     X_sum = torch.einsum("btji,oj->btoi", [X * X, adj])
-    X_sum = torch.div(X_sum, D) 
+    X_sum = torch.div(X_sum, _nz(D)) 
     X_mean = aggregate_mean(X, adj)  # D^{-1} A X
     var = torch.relu(X_sum - X_mean * X_mean)  # relu(mean_squares_X - mean_X^2)
     return var
